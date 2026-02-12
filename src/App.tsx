@@ -725,15 +725,19 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div className="app-header-row">
-          <div>
-            <h1>Roadmapping Tool</h1>
-            <p>Create multiple plans, schedule work, and track daily resource capacity.</p>
+      <header className="app-header app-bar">
+        <div className="app-bar-row">
+          <div className="app-bar-logo-slot">
+            <img src="/logo.png" alt="Ignite logo" className="app-logo" />
           </div>
-          <Button type="button" onClick={openRoadmapDialog}>
-            Create new roadmap
-          </Button>
+          <div className="app-brand app-brand-center">
+            <span>Ignite Roadmapping Tool</span>
+          </div>
+          <div className="app-bar-actions">
+            <Button type="button" onClick={openRoadmapDialog}>
+              Create new roadmap
+            </Button>
+          </div>
         </div>
       </header>
 
@@ -846,12 +850,6 @@ function App() {
                         const week = Math.floor((day - 1) / WORK_DAYS_PER_WEEK) + 1
                         const dayOfWeek = ((day - 1) % WORK_DAYS_PER_WEEK) + 1
                         const availability = availabilityByDay[index]
-                        const hasNegative = RESOURCE_FIELDS.some(
-                          (field) => availability && availability[field.key] < 0,
-                        )
-                        const hasZero = RESOURCE_FIELDS.some(
-                          (field) => availability && availability[field.key] === 0,
-                        )
                         return (
                           <div key={day} className={`day-cell ${dayOfWeek === 1 ? 'week-start' : ''}`}>
                             <div className="left-day-cell">
