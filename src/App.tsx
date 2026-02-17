@@ -1128,6 +1128,70 @@ function App() {
     return 'resource-value'
   }
 
+  const handleExportToCSV = () => {
+    if (!activeRoadmap) {
+      return
+    }
+
+    // Create CSV data for CSV Gantt chart
+    const csvRows: string[] = []
+    
+    // Header row
+    csvRows.push('Task Name,Lane,Start Date,End Date,Duration (days),Backend,Frontend,Designers,QA')
+    
+    // Add tasks
+    activeRoadmap.tasks.forEach((task) => {
+      const lane = activeRoadmap.lanes.find((l) => l.id === task.laneId)
+      const startDate = boardDayToDate(activeRoadmap.startDate, task.startDay)
+      const endDate = boardDayToDate(activeRoadmap.startDate, getTaskEndDay(task))
+      
+      csvRows.push(
+        [
+          `"${task.name.replace(/"/g, '""')}"`,
+          `"${lane?.name || 'Unknown'}"`,
+          startDate.toISOString().split('T')[0],
+          endDate.toISOString().split('T')[0],
+          task.duration,
+          formatResourceValue(task.resources.backend),
+          formatResourceValue(task.resources.frontend),
+          formatResourceValue(task.resources.designers),
+          formatResourceValue(task.resources.qa),
+        ].join(','),
+      )
+    })
+    
+    // Add empty row separator
+    csvRows.push('')
+    
+    // Add milestones section
+    csvRows.push('Milestone Name,Date,Day')
+    activeRoadmap.milestones.forEach((milestone) => {
+      const milestoneDate = boardDayToDate(activeRoadmap.startDate, milestone.day)
+      csvRows.push(
+        [
+          `"${milestone.name.replace(/"/g, '""')}"`,
+          milestoneDate.toISOString().split('T')[0],
+          milestone.day,
+        ].join(','),
+      )
+    })
+    
+    // Create and download file
+    const csvContent = csvRows.join('\n')
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    const url = URL.createObjectURL(blob)
+    
+    link.setAttribute('href', url)
+    link.setAttribute('download', `${activeRoadmap.name.replace(/[^a-z0-9]/gi, '_')}_gantt.csv`)
+    link.style.visibility = 'hidden'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    
+    setNotice({ message: 'Exported roadmap data to CSV.', variant: 'default' })
+  }
+
   const deleteDialogTitle =
     deleteIntent?.kind === 'task'
       ? 'Delete task?'
@@ -1248,6 +1312,9 @@ function App() {
                   </Button>
                   <Button type="button" onClick={handleAddMilestone}>
                     Add milestone
+                  </Button>
+                  <Button type="button" variant="outline" onClick={handleExportToCSV}>
+                    Export to CSV
                   </Button>
                 </div>
               </section>
