@@ -137,6 +137,23 @@ const toPositiveInt = (value: string, fallback = 0): number => {
   return Math.max(0, parsed)
 }
 
+const toPositiveNumber = (value: string, fallback = 0): number => {
+  const parsed = Number.parseFloat(value)
+  if (Number.isNaN(parsed)) {
+    return fallback
+  }
+  return Math.max(0, parsed)
+}
+
+const formatResourceValue = (value: number): string => {
+  // If it's a whole number, show without decimals
+  if (Number.isInteger(value)) {
+    return value.toString()
+  }
+  // Otherwise show with up to 2 decimal places, removing trailing zeros
+  return value.toFixed(2).replace(/\.?0+$/, '')
+}
+
 const buildId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
     return crypto.randomUUID()
@@ -295,10 +312,12 @@ function App() {
   const [activeRoadmapId, setActiveRoadmapId] = useState<string | null>(INITIAL_STORED_STATE.activeRoadmapId)
   const [roadmapDraft, setRoadmapDraft] = useState<RoadmapDraft>(createRoadmapDraft)
   const [taskDraft, setTaskDraft] = useState<TaskDraft>(buildTaskDraft())
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null)
   const [isRoadmapDialogOpen, setIsRoadmapDialogOpen] = useState(false)
   const [isTaskModalOpen, setIsTaskModalOpen] = useState(false)
   const [isLaneDialogOpen, setIsLaneDialogOpen] = useState(false)
   const [laneNameDraft, setLaneNameDraft] = useState('')
+  const [editingLaneId, setEditingLaneId] = useState<string | null>(null)
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null)
   const [draggedOverLaneId, setDraggedOverLaneId] = useState<string | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
@@ -360,7 +379,27 @@ function App() {
     if (!activeRoadmap) {
       return
     }
+    setEditingTaskId(null)
     setTaskDraft(buildTaskDraft(activeRoadmap.lanes[0]?.id ?? ''))
+    setTaskErrors({})
+    setIsTaskModalOpen(true)
+  }
+
+  const openEditTaskModal = (taskId: string) => {
+    if (!activeRoadmap) {
+      return
+    }
+    const task = activeRoadmap.tasks.find((t) => t.id === taskId)
+    if (!task) {
+      return
+    }
+    setEditingTaskId(taskId)
+    setTaskDraft({
+      name: task.name,
+      laneId: task.laneId,
+      duration: task.duration,
+      resources: { ...task.resources },
+    })
     setTaskErrors({})
     setIsTaskModalOpen(true)
   }
@@ -368,6 +407,7 @@ function App() {
   const closeTaskModal = () => {
     setIsTaskModalOpen(false)
     setTaskDraft(buildTaskDraft(activeRoadmap?.lanes[0]?.id ?? ''))
+    setEditingTaskId(null)
     setTaskErrors({})
   }
 
@@ -376,7 +416,7 @@ function App() {
       ...current,
       capacity: {
         ...current.capacity,
-        [key]: toPositiveInt(value),
+        [key]: toPositiveNumber(value),
       },
     }))
   }
@@ -386,7 +426,7 @@ function App() {
       ...current,
       resources: {
         ...current.resources,
-        [key]: toPositiveInt(value),
+        [key]: toPositiveNumber(value),
       },
     }))
   }
@@ -427,7 +467,7 @@ function App() {
     setNotice({ message: `Created roadmap "${trimmedName}"`, variant: 'default' })
   }
 
-  const handleCreateTask = (event: FormEvent<HTMLFormElement>) => {
+  const handleSaveTask = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!activeRoadmap) {
       return
@@ -449,28 +489,109 @@ function App() {
       return
     }
 
-    const nextStartDay = findNextViableDay(
-      activeRoadmap,
-      taskDraft.laneId,
-      taskDraft.duration,
-      taskDraft.resources,
-    )
-    const task: Task = {
-      id: buildId(),
-      name: trimmedName,
-      laneId: taskDraft.laneId,
-      duration: taskDraft.duration,
-      resources: taskDraft.resources,
-      startDay: nextStartDay,
+    if (editingTaskId) {
+      // Edit existing task
+      const existingTask = activeRoadmap.tasks.find((t) => t.id === editingTaskId)
+      if (!existingTask) {
+        return
+      }
+
+      // Check if lane or duration changed - if so, need to find new viable day
+      const needsRescheduling =
+        existingTask.laneId !== taskDraft.laneId || existingTask.duration !== taskDraft.duration
+
+      let nextStartDay = existingTask.startDay
+
+      if (needsRescheduling) {
+        // Check if the task fits in its current position with new dimensions
+        const fitsInCurrentSpot =
+          !hasLaneConflict(
+            activeRoadmap.tasks,
+            taskDraft.laneId,
+            existingTask.startDay,
+            taskDraft.duration,
+            editingTaskId,
+          ) &&
+          hasNonNegativeResources(
+            activeRoadmap,
+            existingTask.startDay,
+            taskDraft.duration,
+            taskDraft.resources,
+            editingTaskId,
+          )
+
+        if (!fitsInCurrentSpot) {
+          nextStartDay = findNextViableDay(activeRoadmap, taskDraft.laneId, taskDraft.duration, taskDraft.resources)
+        }
+      } else {
+        // Same lane and duration, check if resources changed and still fit
+        const resourcesChanged = RESOURCE_FIELDS.some(
+          (field) => existingTask.resources[field.key] !== taskDraft.resources[field.key],
+        )
+
+        if (resourcesChanged) {
+          const fitsInCurrentSpot = hasNonNegativeResources(
+            activeRoadmap,
+            existingTask.startDay,
+            taskDraft.duration,
+            taskDraft.resources,
+            editingTaskId,
+          )
+
+          if (!fitsInCurrentSpot) {
+            nextStartDay = findNextViableDay(
+              activeRoadmap,
+              taskDraft.laneId,
+              taskDraft.duration,
+              taskDraft.resources,
+            )
+          }
+        }
+      }
+
+      const updatedTask: Task = {
+        id: editingTaskId,
+        name: trimmedName,
+        laneId: taskDraft.laneId,
+        duration: taskDraft.duration,
+        resources: taskDraft.resources,
+        startDay: nextStartDay,
+      }
+
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? { ...roadmap, tasks: roadmap.tasks.map((t) => (t.id === editingTaskId ? updatedTask : t)) }
+            : roadmap,
+        ),
+      )
+      setNotice({ message: `Updated "${updatedTask.name}" at ${formatBoardDay(nextStartDay)}.`, variant: 'default' })
+    } else {
+      // Create new task
+      const nextStartDay = findNextViableDay(
+        activeRoadmap,
+        taskDraft.laneId,
+        taskDraft.duration,
+        taskDraft.resources,
+      )
+      const task: Task = {
+        id: buildId(),
+        name: trimmedName,
+        laneId: taskDraft.laneId,
+        duration: taskDraft.duration,
+        resources: taskDraft.resources,
+        startDay: nextStartDay,
+      }
+
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id ? { ...roadmap, tasks: [...roadmap.tasks, task] } : roadmap,
+        ),
+      )
+      setNotice({ message: `Added "${task.name}" at ${formatBoardDay(nextStartDay)}.`, variant: 'default' })
     }
 
-    setRoadmaps((current) =>
-      current.map((roadmap) =>
-        roadmap.id === activeRoadmap.id ? { ...roadmap, tasks: [...roadmap.tasks, task] } : roadmap,
-      ),
-    )
     setTaskErrors({})
-    setNotice({ message: `Added "${task.name}" at ${formatBoardDay(nextStartDay)}.`, variant: 'default' })
     closeTaskModal()
   }
 
@@ -478,12 +599,27 @@ function App() {
     if (!activeRoadmap) {
       return
     }
+    setEditingLaneId(null)
     setLaneNameDraft('')
     setLaneErrors({})
     setIsLaneDialogOpen(true)
   }
 
-  const handleCreateLane = (event: FormEvent<HTMLFormElement>) => {
+  const handleEditLane = (laneId: string) => {
+    if (!activeRoadmap) {
+      return
+    }
+    const lane = activeRoadmap.lanes.find((l) => l.id === laneId)
+    if (!lane) {
+      return
+    }
+    setEditingLaneId(laneId)
+    setLaneNameDraft(lane.name)
+    setLaneErrors({})
+    setIsLaneDialogOpen(true)
+  }
+
+  const handleSaveLane = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!activeRoadmap) {
       return
@@ -495,24 +631,44 @@ function App() {
       return
     }
 
-    const newLane: Lane = {
-      id: buildId(),
-      name: laneName,
+    if (editingLaneId) {
+      // Edit existing lane
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? {
+                ...roadmap,
+                lanes: roadmap.lanes.map((lane) =>
+                  lane.id === editingLaneId ? { ...lane, name: laneName } : lane,
+                ),
+              }
+            : roadmap,
+        ),
+      )
+      setNotice({ message: `Updated swimlane to "${laneName}".`, variant: 'default' })
+    } else {
+      // Create new lane
+      const newLane: Lane = {
+        id: buildId(),
+        name: laneName,
+      }
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? {
+                ...roadmap,
+                lanes: [...roadmap.lanes, newLane],
+              }
+            : roadmap,
+        ),
+      )
+      setNotice({ message: `Added swimlane "${newLane.name}".`, variant: 'default' })
     }
-    setRoadmaps((current) =>
-      current.map((roadmap) =>
-        roadmap.id === activeRoadmap.id
-          ? {
-              ...roadmap,
-              lanes: [...roadmap.lanes, newLane],
-            }
-          : roadmap,
-      ),
-    )
+
     setIsLaneDialogOpen(false)
     setLaneNameDraft('')
+    setEditingLaneId(null)
     setLaneErrors({})
-    setNotice({ message: `Added swimlane "${newLane.name}".`, variant: 'default' })
   }
 
   const handleDeleteTask = (taskId: string) => {
@@ -829,16 +985,28 @@ function App() {
                       {activeRoadmap.lanes.map((lane) => (
                         <div key={lane.id} className="lane-header">
                           <span className="lane-title">{lane.name}</span>
-                          <Button
-                            type="button"
-                            variant="destructive"
-                            size="xs"
-                            className="icon-button icon-button-danger lane-remove-button"
-                            onClick={() => handleDeleteLane(lane.id)}
-                            aria-label={`Remove ${lane.name} swimlane`}
-                          >
-                            Remove
-                          </Button>
+                          <div style={{ display: 'flex', gap: '0.5rem' }}>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="xs"
+                              className="icon-button"
+                              onClick={() => handleEditLane(lane.id)}
+                              aria-label={`Edit ${lane.name} swimlane`}
+                            >
+                              Edit
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="destructive"
+                              size="xs"
+                              className="icon-button icon-button-danger lane-remove-button"
+                              onClick={() => handleDeleteLane(lane.id)}
+                              aria-label={`Remove ${lane.name} swimlane`}
+                            >
+                              Remove
+                            </Button>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -859,10 +1027,12 @@ function App() {
                             </div>
 
                             <div className='right-day-cell'>
-                              {RESOURCE_FIELDS.map((field) => (                              
+                              {RESOURCE_FIELDS.map((field) => (
                                 <div key={field.key}>
-                                  <span className={renderAvailabilityClass(availability[field.key])}>{field.short} : {availability[field.key]}</span>
-                                  <br/>
+                                  <span className={renderAvailabilityClass(availability[field.key])}>
+                                    {field.short} : {formatResourceValue(availability[field.key])}
+                                  </span>
+                                  <br />
                                 </div>
                               ))}
                             </div>
@@ -904,23 +1074,42 @@ function App() {
                             >
                               <div className="task-card-header">
                                 <strong>{task.name}</strong>
-                                <Button
-                                  type="button"
-                                  variant="destructive"
-                                  size="xs"
-                                  className="icon-button icon-button-danger"
-                                  onMouseDown={(event) => {
-                                    event.preventDefault()
-                                    event.stopPropagation()
-                                  }}
-                                  onClick={(event) => {
-                                    event.preventDefault()
-                                    event.stopPropagation()
-                                    handleDeleteTask(task.id)
-                                  }}
-                                >
-                                  Delete
-                                </Button>
+                                <div style={{ display: 'flex', gap: '0.25rem' }}>
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="xs"
+                                    className="icon-button"
+                                    onMouseDown={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                    }}
+                                    onClick={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                      openEditTaskModal(task.id)
+                                    }}
+                                  >
+                                    Edit
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="destructive"
+                                    size="xs"
+                                    className="icon-button icon-button-danger"
+                                    onMouseDown={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                    }}
+                                    onClick={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                      handleDeleteTask(task.id)
+                                    }}
+                                  >
+                                    Delete
+                                  </Button>
+                                </div>
                               </div>
                               <span>
                                 {formatBoardDay(task.startDay)} to {formatBoardDay(getTaskEndDay(task))}
@@ -928,7 +1117,7 @@ function App() {
                               <div className="task-resource-row">
                                 {RESOURCE_FIELDS.map((field) => (
                                   <small key={field.key}>
-                                    {field.short}: {task.resources[field.key]}
+                                    {field.short}: {formatResourceValue(task.resources[field.key])}
                                   </small>
                                 ))}
                               </div>
@@ -972,7 +1161,7 @@ function App() {
                             <td>{formatBoardDay(day)}</td>
                             {RESOURCE_FIELDS.map((field) => (
                               <td key={field.key} className={renderAvailabilityClass(availability[field.key])}>
-                                {availability[field.key]}
+                                {formatResourceValue(availability[field.key])}
                               </td>
                             ))}
                             <td>{hasNegative ? 'Overbooked' : hasZero ? 'At limit' : 'Available'}</td>
@@ -1029,6 +1218,7 @@ function App() {
                     id={`roadmap-${field.key}`}
                     type="number"
                     min={0}
+                    step="0.1"
                     value={roadmapDraft.capacity[field.key]}
                     onChange={(event) => updateRoadmapDraftCapacity(field.key, event.target.value)}
                   />
@@ -1056,8 +1246,8 @@ function App() {
       {isTaskModalOpen && activeRoadmap ? (
         <div className="modal-backdrop" onClick={closeTaskModal}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <h2>Add task</h2>
-            <form className="stack-form" onSubmit={handleCreateTask}>
+            <h2>{editingTaskId ? 'Edit task' : 'Add task'}</h2>
+            <form className="stack-form" onSubmit={handleSaveTask}>
               <div className="form-field">
                 <FieldLabel htmlFor="task-name">Task name</FieldLabel>
                 <Input
@@ -1126,6 +1316,7 @@ function App() {
                       id={`task-${field.key}`}
                       type="number"
                       min={0}
+                      step="0.1"
                       value={taskDraft.resources[field.key]}
                       onChange={(event) => updateTaskDraftResources(field.key, event.target.value)}
                     />
@@ -1137,7 +1328,7 @@ function App() {
                 <Button type="button" variant="secondary" className="secondary-button" onClick={closeTaskModal}>
                   Cancel
                 </Button>
-                <Button type="submit">Add task</Button>
+                <Button type="submit">{editingTaskId ? 'Save' : 'Add task'}</Button>
               </div>
             </form>
           </div>
@@ -1150,15 +1341,20 @@ function App() {
           setIsLaneDialogOpen(isOpen)
           if (!isOpen) {
             setLaneNameDraft('')
+            setEditingLaneId(null)
           }
         }}
       >
         <DialogContent className="app-dialog-content">
           <DialogHeader>
-            <DialogTitle>Add swimlane</DialogTitle>
-            <DialogDescription>Create a new vertical swimlane for task placement.</DialogDescription>
+            <DialogTitle>{editingLaneId ? 'Edit swimlane' : 'Add swimlane'}</DialogTitle>
+            <DialogDescription>
+              {editingLaneId
+                ? 'Update the name of this swimlane.'
+                : 'Create a new vertical swimlane for task placement.'}
+            </DialogDescription>
           </DialogHeader>
-          <form className="stack-form" onSubmit={handleCreateLane}>
+          <form className="stack-form" onSubmit={handleSaveLane}>
             <div className="form-field">
               <FieldLabel htmlFor="lane-name">Swimlane name</FieldLabel>
               <Input
@@ -1184,11 +1380,12 @@ function App() {
                 onClick={() => {
                   setIsLaneDialogOpen(false)
                   setLaneNameDraft('')
+                  setEditingLaneId(null)
                 }}
               >
                 Cancel
               </Button>
-              <Button type="submit">Add swimlane</Button>
+              <Button type="submit">{editingLaneId ? 'Save' : 'Add swimlane'}</Button>
             </DialogFooter>
           </form>
         </DialogContent>
