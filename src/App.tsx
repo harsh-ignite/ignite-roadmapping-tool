@@ -37,6 +37,12 @@ type Lane = {
   name: string
 }
 
+type Milestone = {
+  id: string
+  name: string
+  day: number
+}
+
 type Task = {
   id: string
   name: string
@@ -49,13 +55,18 @@ type Task = {
 type Roadmap = {
   id: string
   name: string
+  startDate: string
+  endDate: string
   capacity: ResourceSet
   lanes: Lane[]
   tasks: Task[]
+  milestones: Milestone[]
 }
 
 type RoadmapDraft = {
   name: string
+  startDate: string
+  endDate: string
   capacity: ResourceSet
 }
 
@@ -64,6 +75,11 @@ type TaskDraft = {
   laneId: string
   duration: number
   resources: ResourceSet
+}
+
+type MilestoneDraft = {
+  name: string
+  day: number
 }
 
 type DeleteIntent =
@@ -83,6 +99,11 @@ type DeleteIntent =
       roadmapId: string
       roadmapName: string
     }
+  | {
+      kind: 'milestone'
+      milestoneId: string
+      milestoneName: string
+    }
 
 type Notice = {
   message: string
@@ -91,12 +112,19 @@ type Notice = {
 
 type RoadmapFormErrors = {
   name?: string
+  startDate?: string
+  endDate?: string
 }
 
 type TaskFormErrors = {
   name?: string
   laneId?: string
   duration?: string
+}
+
+type MilestoneFormErrors = {
+  name?: string
+  day?: string
 }
 
 type LaneFormErrors = {
@@ -119,8 +147,22 @@ const createEmptyResources = (): ResourceSet => ({
 
 const createDefaultLanes = (): Lane[] => []
 
+const getDefaultStartDate = (): string => {
+  const today = new Date()
+  return today.toISOString().split('T')[0]
+}
+
+const getDefaultEndDate = (): string => {
+  const today = new Date()
+  const threeMonthsLater = new Date(today)
+  threeMonthsLater.setMonth(today.getMonth() + 3)
+  return threeMonthsLater.toISOString().split('T')[0]
+}
+
 const createRoadmapDraft = (): RoadmapDraft => ({
   name: '',
+  startDate: getDefaultStartDate(),
+  endDate: getDefaultEndDate(),
   capacity: {
     backend: 2,
     frontend: 2,
@@ -128,6 +170,48 @@ const createRoadmapDraft = (): RoadmapDraft => ({
     qa: 1,
   },
 })
+
+const countWorkDaysBetween = (startDate: string, endDate: string): number => {
+  const start = new Date(startDate)
+  const end = new Date(endDate)
+  let count = 0
+  const current = new Date(start)
+
+  while (current <= end) {
+    const dayOfWeek = current.getDay()
+    // 0 = Sunday, 6 = Saturday
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      count++
+    }
+    current.setDate(current.getDate() + 1)
+  }
+
+  return count
+}
+
+const boardDayToDate = (roadmapStartDate: string, boardDay: number): Date => {
+  const startDate = new Date(roadmapStartDate)
+  let workDaysAdded = 0
+  const current = new Date(startDate)
+
+  while (workDaysAdded < boardDay) {
+    const dayOfWeek = current.getDay()
+    // Skip weekends
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      workDaysAdded++
+      if (workDaysAdded === boardDay) {
+        return current
+      }
+    }
+    current.setDate(current.getDate() + 1)
+  }
+
+  return current
+}
+
+const formatDate = (date: Date): string => {
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
 
 const toPositiveInt = (value: string, fallback = 0): number => {
   const parsed = Number.parseInt(value, 10)
@@ -170,11 +254,13 @@ const rangesOverlap = (startA: number, durationA: number, startB: number, durati
 }
 
 const computeBoardHorizon = (roadmap: Roadmap) => {
+  const dateRangeDays = countWorkDaysBetween(roadmap.startDate, roadmap.endDate)
   const maxEnd = roadmap.tasks.reduce(
     (highest, task) => Math.max(highest, getTaskEndDay(task)),
-    WORK_DAYS_PER_WEEK * MIN_WEEKS_ON_BOARD,
+    dateRangeDays,
   )
-  return Math.max(WORK_DAYS_PER_WEEK * MIN_WEEKS_ON_BOARD, maxEnd + WORK_DAYS_PER_WEEK)
+  // Use the date range as the horizon, or extend if tasks go beyond
+  return Math.max(dateRangeDays, maxEnd)
 }
 
 const getCommittedForDay = (tasks: Task[], day: number, ignoreTaskId?: string): ResourceSet => {
@@ -257,11 +343,22 @@ const findNextViableDay = (roadmap: Roadmap, laneId: string, duration: number, r
   return findNextLaneFreeDay(roadmap.tasks, laneId, duration, 1)
 }
 
-const formatBoardDay = (day: number) => {
+const formatBoardDay = (day: number, roadmapStartDate?: string) => {
   const week = Math.floor((day - 1) / WORK_DAYS_PER_WEEK) + 1
   const dayOfWeek = ((day - 1) % WORK_DAYS_PER_WEEK) + 1
+  
+  if (roadmapStartDate) {
+    const actualDate = boardDayToDate(roadmapStartDate, day)
+    return `${formatDate(actualDate)} (W${week}D${dayOfWeek})`
+  }
+  
   return `Week ${week}, Day ${dayOfWeek}`
 }
+
+const buildMilestoneDraft = (): MilestoneDraft => ({
+  name: '',
+  day: 1,
+})
 
 const buildTaskDraft = (laneId = ''): TaskDraft => ({
   name: '',
@@ -285,20 +382,37 @@ const loadStoredState = (): { roadmaps: Roadmap[]; activeRoadmapId: string | nul
   try {
     const parsed: { roadmaps?: Roadmap[]; activeRoadmapId?: string | null } = JSON.parse(savedState)
     const parsedRoadmaps = Array.isArray(parsed.roadmaps) ? parsed.roadmaps : []
+    
+    // Migrate old roadmaps without dates or milestones
+    const migratedRoadmaps = parsedRoadmaps.map((roadmap) => {
+      const migrated = { ...roadmap }
+      
+      if (!migrated.startDate || !migrated.endDate) {
+        migrated.startDate = migrated.startDate || getDefaultStartDate()
+        migrated.endDate = migrated.endDate || getDefaultEndDate()
+      }
+      
+      if (!Array.isArray(migrated.milestones)) {
+        migrated.milestones = []
+      }
+      
+      return migrated
+    })
+    
     const parsedActiveId =
       typeof parsed.activeRoadmapId === 'string' || parsed.activeRoadmapId === null
         ? parsed.activeRoadmapId
         : null
 
-    if (parsedRoadmaps.length === 0) {
+    if (migratedRoadmaps.length === 0) {
       return defaultState
     }
 
-    if (parsedActiveId && parsedRoadmaps.some((roadmap) => roadmap.id === parsedActiveId)) {
-      return { roadmaps: parsedRoadmaps, activeRoadmapId: parsedActiveId }
+    if (parsedActiveId && migratedRoadmaps.some((roadmap) => roadmap.id === parsedActiveId)) {
+      return { roadmaps: migratedRoadmaps, activeRoadmapId: parsedActiveId }
     }
 
-    return { roadmaps: parsedRoadmaps, activeRoadmapId: parsedRoadmaps[0].id }
+    return { roadmaps: migratedRoadmaps, activeRoadmapId: migratedRoadmaps[0].id }
   } catch (error) {
     console.error('Unable to load roadmap data from localStorage', error)
     return defaultState
@@ -318,6 +432,9 @@ function App() {
   const [isLaneDialogOpen, setIsLaneDialogOpen] = useState(false)
   const [laneNameDraft, setLaneNameDraft] = useState('')
   const [editingLaneId, setEditingLaneId] = useState<string | null>(null)
+  const [isMilestoneDialogOpen, setIsMilestoneDialogOpen] = useState(false)
+  const [milestoneDraft, setMilestoneDraft] = useState<MilestoneDraft>(buildMilestoneDraft())
+  const [editingMilestoneId, setEditingMilestoneId] = useState<string | null>(null)
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null)
   const [draggedOverLaneId, setDraggedOverLaneId] = useState<string | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
@@ -325,6 +442,7 @@ function App() {
   const [roadmapErrors, setRoadmapErrors] = useState<RoadmapFormErrors>({})
   const [taskErrors, setTaskErrors] = useState<TaskFormErrors>({})
   const [laneErrors, setLaneErrors] = useState<LaneFormErrors>({})
+  const [milestoneErrors, setMilestoneErrors] = useState<MilestoneFormErrors>({})
 
   useEffect(() => {
     localStorage.setItem(
@@ -445,8 +563,21 @@ function App() {
     if (!trimmedName) {
       nextErrors.name = 'Roadmap name is required.'
     }
+    if (!roadmapDraft.startDate) {
+      nextErrors.startDate = 'Start date is required.'
+    }
+    if (!roadmapDraft.endDate) {
+      nextErrors.endDate = 'End date is required.'
+    }
+    if (roadmapDraft.startDate && roadmapDraft.endDate) {
+      const start = new Date(roadmapDraft.startDate)
+      const end = new Date(roadmapDraft.endDate)
+      if (end <= start) {
+        nextErrors.endDate = 'End date must be after start date.'
+      }
+    }
 
-    if (nextErrors.name) {
+    if (Object.keys(nextErrors).length > 0) {
       setRoadmapErrors(nextErrors)
       return
     }
@@ -454,9 +585,12 @@ function App() {
     const roadmap: Roadmap = {
       id: buildId(),
       name: trimmedName,
+      startDate: roadmapDraft.startDate,
+      endDate: roadmapDraft.endDate,
       capacity: roadmapDraft.capacity,
       lanes: createDefaultLanes(),
       tasks: [],
+      milestones: [],
     }
 
     setRoadmaps((current) => [...current, roadmap])
@@ -565,7 +699,10 @@ function App() {
             : roadmap,
         ),
       )
-      setNotice({ message: `Updated "${updatedTask.name}" at ${formatBoardDay(nextStartDay)}.`, variant: 'default' })
+      setNotice({
+        message: `Updated "${updatedTask.name}" at ${formatBoardDay(nextStartDay, activeRoadmap.startDate)}.`,
+        variant: 'default',
+      })
     } else {
       // Create new task
       const nextStartDay = findNextViableDay(
@@ -588,7 +725,10 @@ function App() {
           roadmap.id === activeRoadmap.id ? { ...roadmap, tasks: [...roadmap.tasks, task] } : roadmap,
         ),
       )
-      setNotice({ message: `Added "${task.name}" at ${formatBoardDay(nextStartDay)}.`, variant: 'default' })
+      setNotice({
+        message: `Added "${task.name}" at ${formatBoardDay(nextStartDay, activeRoadmap.startDate)}.`,
+        variant: 'default',
+      })
     }
 
     setTaskErrors({})
@@ -669,6 +809,118 @@ function App() {
     setLaneNameDraft('')
     setEditingLaneId(null)
     setLaneErrors({})
+  }
+
+  const handleAddMilestone = () => {
+    if (!activeRoadmap) {
+      return
+    }
+    setEditingMilestoneId(null)
+    setMilestoneDraft(buildMilestoneDraft())
+    setMilestoneErrors({})
+    setIsMilestoneDialogOpen(true)
+  }
+
+  const handleEditMilestone = (milestoneId: string) => {
+    if (!activeRoadmap) {
+      return
+    }
+    const milestone = activeRoadmap.milestones.find((m) => m.id === milestoneId)
+    if (!milestone) {
+      return
+    }
+    setEditingMilestoneId(milestoneId)
+    setMilestoneDraft({
+      name: milestone.name,
+      day: milestone.day,
+    })
+    setMilestoneErrors({})
+    setIsMilestoneDialogOpen(true)
+  }
+
+  const handleSaveMilestone = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!activeRoadmap) {
+      return
+    }
+
+    const milestoneName = milestoneDraft.name.trim()
+    const nextErrors: MilestoneFormErrors = {}
+    if (!milestoneName) {
+      nextErrors.name = 'Milestone name is required.'
+    }
+    if (milestoneDraft.day < 1) {
+      nextErrors.day = 'Day must be at least 1.'
+    }
+    if (Object.keys(nextErrors).length > 0) {
+      setMilestoneErrors(nextErrors)
+      return
+    }
+
+    if (editingMilestoneId) {
+      // Edit existing milestone
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? {
+                ...roadmap,
+                milestones: roadmap.milestones.map((milestone) =>
+                  milestone.id === editingMilestoneId
+                    ? { ...milestone, name: milestoneName, day: milestoneDraft.day }
+                    : milestone,
+                ),
+              }
+            : roadmap,
+        ),
+      )
+      setNotice({
+        message: `Updated milestone "${milestoneName}".`,
+        variant: 'default',
+      })
+    } else {
+      // Create new milestone
+      const newMilestone: Milestone = {
+        id: buildId(),
+        name: milestoneName,
+        day: milestoneDraft.day,
+      }
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? {
+                ...roadmap,
+                milestones: [...roadmap.milestones, newMilestone].sort((a, b) => a.day - b.day),
+              }
+            : roadmap,
+        ),
+      )
+      setNotice({
+        message: `Added milestone "${newMilestone.name}" at ${formatBoardDay(newMilestone.day, activeRoadmap.startDate)}.`,
+        variant: 'default',
+      })
+    }
+
+    setIsMilestoneDialogOpen(false)
+    setMilestoneDraft(buildMilestoneDraft())
+    setEditingMilestoneId(null)
+    setMilestoneErrors({})
+  }
+
+  const handleDeleteMilestone = (milestoneId: string) => {
+    if (!activeRoadmap) {
+      return
+    }
+
+    const milestone = activeRoadmap.milestones.find((m) => m.id === milestoneId)
+    if (!milestone) {
+      return
+    }
+
+    setDeleteIntent({
+      kind: 'milestone',
+      milestoneId: milestone.id,
+      milestoneName: milestone.name,
+    })
   }
 
   const handleDeleteTask = (taskId: string) => {
@@ -761,6 +1013,22 @@ function App() {
       return
     }
 
+    if (deleteIntent.kind === 'milestone') {
+      setRoadmaps((current) =>
+        current.map((roadmap) =>
+          roadmap.id === activeRoadmap.id
+            ? {
+                ...roadmap,
+                milestones: roadmap.milestones.filter((milestone) => milestone.id !== deleteIntent.milestoneId),
+              }
+            : roadmap,
+        ),
+      )
+      setNotice({ message: `Removed milestone "${deleteIntent.milestoneName}".`, variant: 'default' })
+      setDeleteIntent(null)
+      return
+    }
+
     if (activeRoadmap.lanes.length <= 1) {
       setNotice({ message: 'At least one swimlane is required.', variant: 'destructive' })
       setDeleteIntent(null)
@@ -842,7 +1110,10 @@ function App() {
           : roadmap,
       ),
     )
-    setNotice({ message: `Moved "${movingTask.name}" to ${formatBoardDay(nextFreeDay)}.`, variant: 'default' })
+    setNotice({
+      message: `Moved "${movingTask.name}" to ${formatBoardDay(nextFreeDay, activeRoadmap.startDate)}.`,
+      variant: 'default',
+    })
     setDraggingTaskId(null)
     setDraggedOverLaneId(null)
   }
@@ -864,7 +1135,9 @@ function App() {
         ? 'Delete swimlane?'
         : deleteIntent?.kind === 'roadmap'
           ? 'Delete roadmap?'
-          : ''
+          : deleteIntent?.kind === 'milestone'
+            ? 'Delete milestone?'
+            : ''
 
   const deleteDialogDescription =
     deleteIntent?.kind === 'task'
@@ -877,7 +1150,9 @@ function App() {
           }.`
         : deleteIntent?.kind === 'roadmap'
           ? `This will remove roadmap "${deleteIntent.roadmapName}" and all of its tasks.`
-          : ''
+          : deleteIntent?.kind === 'milestone'
+            ? `This will remove milestone "${deleteIntent.milestoneName}".`
+            : ''
 
   return (
     <div className="app-shell">
@@ -959,6 +1234,7 @@ function App() {
                 <div>
                   <h2>{activeRoadmap.name}</h2>
                   <p>
+                    {formatDate(new Date(activeRoadmap.startDate))} to {formatDate(new Date(activeRoadmap.endDate))} •{' '}
                     {activeRoadmap.lanes.length} swimlanes, {activeRoadmap.tasks.length} task
                     {activeRoadmap.tasks.length === 1 ? '' : 's'}
                   </p>
@@ -969,6 +1245,9 @@ function App() {
                   </Button>
                   <Button type="button" onClick={openTaskModal} disabled={activeRoadmap.lanes.length < 1}>
                     Add task
+                  </Button>
+                  <Button type="button" onClick={handleAddMilestone}>
+                    Add milestone
                   </Button>
                 </div>
               </section>
@@ -1044,6 +1323,7 @@ function App() {
                     <div
                       className="lane-columns"
                       style={{
+                        position: 'relative',
                         gridTemplateColumns: `repeat(${activeRoadmap.lanes.length}, minmax(220px, 1fr))`,
                         minHeight: `${boardHorizon * ROW_HEIGHT}px`,
                       }}
@@ -1112,7 +1392,8 @@ function App() {
                                 </div>
                               </div>
                               <span>
-                                {formatBoardDay(task.startDay)} to {formatBoardDay(getTaskEndDay(task))}
+                                {formatBoardDay(task.startDay, activeRoadmap.startDate)} to{' '}
+                                {formatBoardDay(getTaskEndDay(task), activeRoadmap.startDate)}
                               </span>
                               <div className="task-resource-row">
                                 {RESOURCE_FIELDS.map((field) => (
@@ -1123,6 +1404,45 @@ function App() {
                               </div>
                             </div>
                           ))}
+                        </div>
+                      ))}
+                      
+                      {/* Milestone overlays */}
+                      {activeRoadmap.milestones.map((milestone) => (
+                        <div
+                          key={milestone.id}
+                          className="milestone-line"
+                          style={{
+                            position: 'absolute',
+                            top: `${(milestone.day - 1) * ROW_HEIGHT}px`,
+                            left: 0,
+                            right: 0,
+                            height: '2px',
+                            backgroundColor: '#ff6b6b',
+                            zIndex: 10,
+                            pointerEvents: 'none',
+                          }}
+                        >
+                          <div
+                            style={{
+                              position: 'absolute',
+                              top: '-20px',
+                              left: '8px',
+                              backgroundColor: '#ff6b6b',
+                              color: 'white',
+                              padding: '2px 8px',
+                              borderRadius: '4px',
+                              fontSize: '12px',
+                              fontWeight: 'bold',
+                              whiteSpace: 'nowrap',
+                              pointerEvents: 'auto',
+                              cursor: 'pointer',
+                            }}
+                            onClick={() => handleEditMilestone(milestone.id)}
+                            title="Click to edit milestone"
+                          >
+                            {milestone.name}
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -1158,7 +1478,7 @@ function App() {
 
                         return (
                           <tr key={day} className={hasNegative ? 'status-negative' : hasZero ? 'status-zero' : ''}>
-                            <td>{formatBoardDay(day)}</td>
+                            <td>{formatBoardDay(day, activeRoadmap.startDate)}</td>
                             {RESOURCE_FIELDS.map((field) => (
                               <td key={field.key} className={renderAvailabilityClass(availability[field.key])}>
                                 {formatResourceValue(availability[field.key])}
@@ -1210,6 +1530,41 @@ function App() {
               />
               <FieldError>{roadmapErrors.name}</FieldError>
             </div>
+
+            <div className="form-field">
+              <FieldLabel htmlFor="roadmap-start-date">Start date</FieldLabel>
+              <Input
+                id="roadmap-start-date"
+                type="date"
+                value={roadmapDraft.startDate}
+                onChange={(event) => {
+                  setRoadmapDraft((current) => ({ ...current, startDate: event.target.value }))
+                  if (roadmapErrors.startDate) {
+                    setRoadmapErrors((current) => ({ ...current, startDate: undefined }))
+                  }
+                }}
+                aria-invalid={roadmapErrors.startDate ? 'true' : 'false'}
+              />
+              <FieldError>{roadmapErrors.startDate}</FieldError>
+            </div>
+
+            <div className="form-field">
+              <FieldLabel htmlFor="roadmap-end-date">End date</FieldLabel>
+              <Input
+                id="roadmap-end-date"
+                type="date"
+                value={roadmapDraft.endDate}
+                onChange={(event) => {
+                  setRoadmapDraft((current) => ({ ...current, endDate: event.target.value }))
+                  if (roadmapErrors.endDate) {
+                    setRoadmapErrors((current) => ({ ...current, endDate: undefined }))
+                  }
+                }}
+                aria-invalid={roadmapErrors.endDate ? 'true' : 'false'}
+              />
+              <FieldError>{roadmapErrors.endDate}</FieldError>
+            </div>
+
             <div className="resource-grid">
               {RESOURCE_FIELDS.map((field) => (
                 <div key={field.key} className="resource-field">
@@ -1386,6 +1741,101 @@ function App() {
                 Cancel
               </Button>
               <Button type="submit">{editingLaneId ? 'Save' : 'Add swimlane'}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={isMilestoneDialogOpen}
+        onOpenChange={(isOpen) => {
+          setIsMilestoneDialogOpen(isOpen)
+          if (!isOpen) {
+            setMilestoneDraft(buildMilestoneDraft())
+            setEditingMilestoneId(null)
+          }
+        }}
+      >
+        <DialogContent className="app-dialog-content">
+          <DialogHeader>
+            <DialogTitle>{editingMilestoneId ? 'Edit milestone' : 'Add milestone'}</DialogTitle>
+            <DialogDescription>
+              {editingMilestoneId
+                ? 'Update the milestone details.'
+                : 'Create a milestone marker on the roadmap timeline.'}
+            </DialogDescription>
+          </DialogHeader>
+          <form className="stack-form" onSubmit={handleSaveMilestone}>
+            <div className="form-field">
+              <FieldLabel htmlFor="milestone-name">Milestone name</FieldLabel>
+              <Input
+                id="milestone-name"
+                value={milestoneDraft.name}
+                onChange={(event) => {
+                  setMilestoneDraft((current) => ({ ...current, name: event.target.value }))
+                  if (milestoneErrors.name) {
+                    setMilestoneErrors((current) => ({ ...current, name: undefined }))
+                  }
+                }}
+                placeholder="Beta Release"
+                autoFocus
+                aria-invalid={milestoneErrors.name ? 'true' : 'false'}
+              />
+              <FieldError>{milestoneErrors.name}</FieldError>
+            </div>
+            <div className="form-field">
+              <FieldLabel htmlFor="milestone-day">Day (board day number)</FieldLabel>
+              <Input
+                id="milestone-day"
+                type="number"
+                min={1}
+                max={activeRoadmap ? boardHorizon : undefined}
+                value={milestoneDraft.day}
+                onChange={(event) => {
+                  setMilestoneDraft((current) => ({
+                    ...current,
+                    day: Math.max(1, toPositiveInt(event.target.value, 1)),
+                  }))
+                  if (milestoneErrors.day) {
+                    setMilestoneErrors((current) => ({ ...current, day: undefined }))
+                  }
+                }}
+                aria-invalid={milestoneErrors.day ? 'true' : 'false'}
+              />
+              <FieldError>{milestoneErrors.day}</FieldError>
+              {activeRoadmap && milestoneDraft.day >= 1 && (
+                <p style={{ fontSize: '12px', marginTop: '4px', color: '#666' }}>
+                  {formatBoardDay(milestoneDraft.day, activeRoadmap.startDate)}
+                </p>
+              )}
+            </div>
+            <DialogFooter>
+              {editingMilestoneId && (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={() => {
+                    setIsMilestoneDialogOpen(false)
+                    handleDeleteMilestone(editingMilestoneId)
+                  }}
+                  style={{ marginRight: 'auto' }}
+                >
+                  Delete
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                className="secondary-button"
+                onClick={() => {
+                  setIsMilestoneDialogOpen(false)
+                  setMilestoneDraft(buildMilestoneDraft())
+                  setEditingMilestoneId(null)
+                }}
+              >
+                Cancel
+              </Button>
+              <Button type="submit">{editingMilestoneId ? 'Save' : 'Add milestone'}</Button>
             </DialogFooter>
           </form>
         </DialogContent>
