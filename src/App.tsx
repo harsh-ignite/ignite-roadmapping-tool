@@ -1481,7 +1481,7 @@ function App() {
                           className="milestone-line"
                           style={{
                             position: 'absolute',
-                            top: `${(milestone.day - 1) * ROW_HEIGHT}px`,
+                            top: `${milestone.day * ROW_HEIGHT}px`,
                             left: 0,
                             right: 0,
                             height: '2px',
