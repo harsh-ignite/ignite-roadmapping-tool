@@ -75,6 +75,7 @@ type TaskDraft = {
   laneId: string
   duration: number
   resources: ResourceSet
+  startDay?: number
 }
 
 type MilestoneDraft = {
@@ -120,6 +121,7 @@ type TaskFormErrors = {
   name?: string
   laneId?: string
   duration?: string
+  startDay?: string
 }
 
 type MilestoneFormErrors = {
@@ -343,6 +345,61 @@ const findNextViableDay = (roadmap: Roadmap, laneId: string, duration: number, r
   return findNextLaneFreeDay(roadmap.tasks, laneId, duration, 1)
 }
 
+const dateToBoardDay = (roadmapStartDate: string, targetDate: string): number => {
+  const start = new Date(roadmapStartDate)
+  const target = new Date(targetDate)
+  
+  // Reset times to midnight for accurate day comparison
+  start.setHours(0, 0, 0, 0)
+  target.setHours(0, 0, 0, 0)
+  
+  if (target < start) {
+    return 1 // If target is before start, return day 1
+  }
+  
+  let workDays = 0
+  const current = new Date(start)
+  
+  while (current <= target) {
+    const dayOfWeek = current.getDay()
+    // Count working days (skip weekends)
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      workDays++
+    }
+    current.setDate(current.getDate() + 1)
+  }
+  
+  return Math.max(1, workDays)
+}
+
+const dateToISOString = (date: Date): string => {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+const canPlaceTaskAt = (
+  roadmap: Roadmap,
+  laneId: string,
+  startDay: number,
+  duration: number,
+  resources: ResourceSet,
+  ignoreTaskId?: string,
+): { valid: boolean; reason?: string } => {
+  // Check lane conflict
+  if (hasLaneConflict(roadmap.tasks, laneId, startDay, duration, ignoreTaskId)) {
+    return { valid: false, reason: 'Another task occupies this lane during this time period' }
+  }
+  
+  // Check resource availability
+  if (!hasNonNegativeResources(roadmap, startDay, duration, resources, ignoreTaskId)) {
+    return { valid: false, reason: 'Insufficient resources available during this time period' }
+  }
+  
+  return { valid: true }
+}
+
 const formatBoardDay = (day: number, roadmapStartDate?: string) => {
   const week = Math.floor((day - 1) / WORK_DAYS_PER_WEEK) + 1
   const dayOfWeek = ((day - 1) % WORK_DAYS_PER_WEEK) + 1
@@ -517,6 +574,27 @@ function App() {
       laneId: task.laneId,
       duration: task.duration,
       resources: { ...task.resources },
+      startDay: task.startDay,
+    })
+    setTaskErrors({})
+    setIsTaskModalOpen(true)
+  }
+
+  const openCopyTaskModal = (taskId: string) => {
+    if (!activeRoadmap) {
+      return
+    }
+    const task = activeRoadmap.tasks.find((t) => t.id === taskId)
+    if (!task) {
+      return
+    }
+    setEditingTaskId(null)
+    setTaskDraft({
+      name: `Copy of ${task.name}`,
+      laneId: task.laneId,
+      duration: task.duration,
+      resources: { ...task.resources },
+      startDay: undefined,
     })
     setTaskErrors({})
     setIsTaskModalOpen(true)
@@ -630,55 +708,79 @@ function App() {
         return
       }
 
-      // Check if lane or duration changed - if so, need to find new viable day
-      const needsRescheduling =
-        existingTask.laneId !== taskDraft.laneId || existingTask.duration !== taskDraft.duration
+      let nextStartDay: number
 
-      let nextStartDay = existingTask.startDay
-
-      if (needsRescheduling) {
-        // Check if the task fits in its current position with new dimensions
-        const fitsInCurrentSpot =
-          !hasLaneConflict(
-            activeRoadmap.tasks,
-            taskDraft.laneId,
-            existingTask.startDay,
-            taskDraft.duration,
-            editingTaskId,
-          ) &&
-          hasNonNegativeResources(
-            activeRoadmap,
-            existingTask.startDay,
-            taskDraft.duration,
-            taskDraft.resources,
-            editingTaskId,
-          )
-
-        if (!fitsInCurrentSpot) {
-          nextStartDay = findNextViableDay(activeRoadmap, taskDraft.laneId, taskDraft.duration, taskDraft.resources)
-        }
-      } else {
-        // Same lane and duration, check if resources changed and still fit
-        const resourcesChanged = RESOURCE_FIELDS.some(
-          (field) => existingTask.resources[field.key] !== taskDraft.resources[field.key],
+      // If user specified a start day, validate it
+      if (taskDraft.startDay !== undefined) {
+        const placement = canPlaceTaskAt(
+          activeRoadmap,
+          taskDraft.laneId,
+          taskDraft.startDay,
+          taskDraft.duration,
+          taskDraft.resources,
+          editingTaskId,
         )
+        if (!placement.valid) {
+          nextErrors.startDay = placement.reason
+          setTaskErrors(nextErrors)
+          return
+        }
+        nextStartDay = taskDraft.startDay
+      } else {
+        // Auto-schedule: Check if lane or duration changed
+        const needsRescheduling =
+          existingTask.laneId !== taskDraft.laneId || existingTask.duration !== taskDraft.duration
 
-        if (resourcesChanged) {
-          const fitsInCurrentSpot = hasNonNegativeResources(
-            activeRoadmap,
-            existingTask.startDay,
-            taskDraft.duration,
-            taskDraft.resources,
-            editingTaskId,
-          )
-
-          if (!fitsInCurrentSpot) {
-            nextStartDay = findNextViableDay(
-              activeRoadmap,
+        if (needsRescheduling) {
+          // Check if the task fits in its current position with new dimensions
+          const fitsInCurrentSpot =
+            !hasLaneConflict(
+              activeRoadmap.tasks,
               taskDraft.laneId,
+              existingTask.startDay,
+              taskDraft.duration,
+              editingTaskId,
+            ) &&
+            hasNonNegativeResources(
+              activeRoadmap,
+              existingTask.startDay,
               taskDraft.duration,
               taskDraft.resources,
+              editingTaskId,
             )
+
+          if (fitsInCurrentSpot) {
+            nextStartDay = existingTask.startDay
+          } else {
+            nextStartDay = findNextViableDay(activeRoadmap, taskDraft.laneId, taskDraft.duration, taskDraft.resources)
+          }
+        } else {
+          // Same lane and duration, check if resources changed and still fit
+          const resourcesChanged = RESOURCE_FIELDS.some(
+            (field) => existingTask.resources[field.key] !== taskDraft.resources[field.key],
+          )
+
+          if (resourcesChanged) {
+            const fitsInCurrentSpot = hasNonNegativeResources(
+              activeRoadmap,
+              existingTask.startDay,
+              taskDraft.duration,
+              taskDraft.resources,
+              editingTaskId,
+            )
+
+            if (fitsInCurrentSpot) {
+              nextStartDay = existingTask.startDay
+            } else {
+              nextStartDay = findNextViableDay(
+                activeRoadmap,
+                taskDraft.laneId,
+                taskDraft.duration,
+                taskDraft.resources,
+              )
+            }
+          } else {
+            nextStartDay = existingTask.startDay
           }
         }
       }
@@ -705,12 +807,33 @@ function App() {
       })
     } else {
       // Create new task
-      const nextStartDay = findNextViableDay(
-        activeRoadmap,
-        taskDraft.laneId,
-        taskDraft.duration,
-        taskDraft.resources,
-      )
+      let nextStartDay: number
+
+      // If user specified a start day, validate it
+      if (taskDraft.startDay !== undefined) {
+        const placement = canPlaceTaskAt(
+          activeRoadmap,
+          taskDraft.laneId,
+          taskDraft.startDay,
+          taskDraft.duration,
+          taskDraft.resources,
+        )
+        if (!placement.valid) {
+          nextErrors.startDay = placement.reason
+          setTaskErrors(nextErrors)
+          return
+        }
+        nextStartDay = taskDraft.startDay
+      } else {
+        // Auto-schedule to next available slot
+        nextStartDay = findNextViableDay(
+          activeRoadmap,
+          taskDraft.laneId,
+          taskDraft.duration,
+          taskDraft.resources,
+        )
+      }
+
       const task: Task = {
         id: buildId(),
         name: trimmedName,
@@ -1441,6 +1564,23 @@ function App() {
                                   </Button>
                                   <Button
                                     type="button"
+                                    variant="outline"
+                                    size="xs"
+                                    className="icon-button"
+                                    onMouseDown={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                    }}
+                                    onClick={(event) => {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                      openCopyTaskModal(task.id)
+                                    }}
+                                  >
+                                    Copy
+                                  </Button>
+                                  <Button
+                                    type="button"
                                     variant="destructive"
                                     size="xs"
                                     className="icon-button icon-button-danger"
@@ -1728,6 +1868,38 @@ function App() {
                   aria-invalid={taskErrors.duration ? 'true' : 'false'}
                 />
                 <FieldError>{taskErrors.duration}</FieldError>
+              </div>
+
+              <div className="form-field">
+                <FieldLabel htmlFor="task-start-day">Start date (optional)</FieldLabel>
+                <Input
+                  id="task-start-day"
+                  type="date"
+                  value={
+                    taskDraft.startDay
+                      ? dateToISOString(boardDayToDate(activeRoadmap.startDate, taskDraft.startDay))
+                      : ''
+                  }
+                  onChange={(event) => {
+                    if (taskErrors.startDay) {
+                      setTaskErrors((current) => ({ ...current, startDay: undefined }))
+                    }
+                    const dateValue = event.target.value
+                    if (dateValue) {
+                      const boardDay = dateToBoardDay(activeRoadmap.startDate, dateValue)
+                      setTaskDraft((current) => ({ ...current, startDay: boardDay }))
+                    } else {
+                      setTaskDraft((current) => ({ ...current, startDay: undefined }))
+                    }
+                  }}
+                  aria-invalid={taskErrors.startDay ? 'true' : 'false'}
+                />
+                <FieldError>{taskErrors.startDay}</FieldError>
+                {!taskErrors.startDay && (
+                  <p className="text-sm text-muted-foreground mt-1">
+                    Leave blank to auto-schedule at the next available slot
+                  </p>
+                )}
               </div>
 
               <div className="resource-grid">
