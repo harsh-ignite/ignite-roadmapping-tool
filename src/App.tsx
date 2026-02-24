@@ -400,6 +400,156 @@ const canPlaceTaskAt = (
   return { valid: true }
 }
 
+const parseCSV = (csvText: string): string[][] => {
+  const rows: string[][] = []
+  const lines = csvText.split('\n')
+  
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue
+    }
+    
+    const row: string[] = []
+    let currentField = ''
+    let insideQuotes = false
+    
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i]
+      const nextChar = line[i + 1]
+      
+      if (char === '"') {
+        if (insideQuotes && nextChar === '"') {
+          currentField += '"'
+          i++
+        } else {
+          insideQuotes = !insideQuotes
+        }
+      } else if (char === ',' && !insideQuotes) {
+        row.push(currentField.trim())
+        currentField = ''
+      } else {
+        currentField += char
+      }
+    }
+    
+    row.push(currentField.trim())
+    rows.push(row)
+  }
+  
+  return rows
+}
+
+const parseTasksFromCSV = (
+  csvText: string,
+  roadmap: Roadmap,
+): { tasks: Task[]; lanes: Map<string, Lane>; errors: string[] } => {
+  const rows = parseCSV(csvText)
+  const tasks: Task[] = []
+  const lanes = new Map<string, Lane>()
+  const errors: string[] = []
+  
+  // Initialize lanes map with existing lanes
+  roadmap.lanes.forEach((lane) => {
+    lanes.set(lane.name, lane)
+  })
+  
+  if (rows.length === 0) {
+    errors.push('CSV file is empty')
+    return { tasks, lanes, errors }
+  }
+  
+  // Expected header: Task Name,Lane,Start Date,End Date,Duration (days),Backend,Frontend,Designers,QA
+  const header = rows[0]
+  const expectedColumns = ['Task Name', 'Lane', 'Start Date', 'End Date', 'Duration (days)', 'Backend', 'Frontend', 'Designers', 'QA']
+  
+  // Check if header matches (case-insensitive, trimmed)
+  const headerMatches = expectedColumns.every((col, idx) => 
+    header[idx]?.toLowerCase().trim() === col.toLowerCase()
+  )
+  
+  if (!headerMatches) {
+    errors.push('Invalid CSV format. Expected header: Task Name,Lane,Start Date,End Date,Duration (days),Backend,Frontend,Designers,QA')
+    return { tasks, lanes, errors }
+  }
+  
+  // Parse data rows
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i]
+    
+    // Skip empty rows or milestone section (detected by different column count or "Milestone Name" header)
+    if (row.length < expectedColumns.length || row[0] === 'Milestone Name') {
+      break
+    }
+    
+    const [taskName, laneName, startDateStr, , durationStr, backendStr, frontendStr, designersStr, qaStr] = row
+    
+    // Validate required fields
+    if (!taskName?.trim()) {
+      errors.push(`Row ${i + 1}: Task name is required`)
+      continue
+    }
+    
+    if (!laneName?.trim()) {
+      errors.push(`Row ${i + 1}: Lane is required for task "${taskName}"`)
+      continue
+    }
+    
+    const duration = Number.parseInt(durationStr || '0', 10)
+    if (Number.isNaN(duration) || duration < 1) {
+      errors.push(`Row ${i + 1}: Invalid duration for task "${taskName}"`)
+      continue
+    }
+    
+    // Parse start date and convert to board day
+    let startDay = 1
+    if (startDateStr?.trim()) {
+      try {
+        startDay = dateToBoardDay(roadmap.startDate, startDateStr.trim())
+      } catch {
+        errors.push(`Row ${i + 1}: Invalid start date "${startDateStr}" for task "${taskName}"`)
+        continue
+      }
+    }
+    
+    // Parse resources (default to 0 if not specified or invalid)
+    const parseResource = (value: string | undefined): number => {
+      const parsed = Number.parseFloat(value || '0')
+      return Number.isNaN(parsed) ? 0 : Math.max(0, parsed)
+    }
+    
+    const resources: ResourceSet = {
+      backend: parseResource(backendStr),
+      frontend: parseResource(frontendStr),
+      designers: parseResource(designersStr),
+      qa: parseResource(qaStr),
+    }
+    
+    // Create or get lane
+    let lane = lanes.get(laneName.trim())
+    if (!lane) {
+      lane = {
+        id: buildId(),
+        name: laneName.trim(),
+      }
+      lanes.set(laneName.trim(), lane)
+    }
+    
+    // Create task
+    const task: Task = {
+      id: buildId(),
+      name: taskName.trim(),
+      laneId: lane.id,
+      startDay,
+      duration,
+      resources,
+    }
+    
+    tasks.push(task)
+  }
+  
+  return { tasks, lanes, errors }
+}
+
 const formatBoardDay = (day: number, roadmapStartDate?: string) => {
   const week = Math.floor((day - 1) / WORK_DAYS_PER_WEEK) + 1
   const dayOfWeek = ((day - 1) % WORK_DAYS_PER_WEEK) + 1
@@ -1315,6 +1465,79 @@ function App() {
     setNotice({ message: 'Exported roadmap data to CSV.', variant: 'default' })
   }
 
+  const handleImportFromCSV = () => {
+    if (!activeRoadmap) {
+      return
+    }
+
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.csv'
+    
+    input.onchange = (event) => {
+      const file = (event.target as HTMLInputElement).files?.[0]
+      if (!file) {
+        return
+      }
+      
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const csvText = e.target?.result as string
+        if (!csvText) {
+          setNotice({ message: 'Failed to read CSV file.', variant: 'destructive' })
+          return
+        }
+        
+        try {
+          const { tasks, lanes, errors } = parseTasksFromCSV(csvText, activeRoadmap)
+          
+          if (errors.length > 0) {
+            setNotice({ 
+              message: `CSV import completed with ${errors.length} error(s). Check console for details.`, 
+              variant: 'destructive' 
+            })
+            console.error('CSV Import Errors:', errors)
+          }
+          
+          if (tasks.length === 0 && errors.length > 0) {
+            return
+          }
+          
+          // Update roadmap with new lanes and tasks
+          const updatedLanes = Array.from(lanes.values())
+          
+          setRoadmaps((current) =>
+            current.map((roadmap) =>
+              roadmap.id === activeRoadmap.id
+                ? { ...roadmap, lanes: updatedLanes, tasks }
+                : roadmap,
+            ),
+          )
+          
+          const successMessage = errors.length > 0
+            ? `Imported ${tasks.length} task(s) with ${errors.length} error(s). Check console.`
+            : `Successfully imported ${tasks.length} task(s) and ${updatedLanes.length} swimlane(s).`
+          
+          setNotice({ 
+            message: successMessage, 
+            variant: errors.length > 0 ? 'destructive' : 'default' 
+          })
+        } catch (error) {
+          console.error('CSV Import Error:', error)
+          setNotice({ message: 'Failed to parse CSV file.', variant: 'destructive' })
+        }
+      }
+      
+      reader.onerror = () => {
+        setNotice({ message: 'Failed to read CSV file.', variant: 'destructive' })
+      }
+      
+      reader.readAsText(file)
+    }
+    
+    input.click()
+  }
+
   const deleteDialogTitle =
     deleteIntent?.kind === 'task'
       ? 'Delete task?'
@@ -1435,6 +1658,9 @@ function App() {
                   </Button>
                   <Button type="button" onClick={handleAddMilestone}>
                     Add milestone
+                  </Button>
+                  <Button type="button" variant="outline" onClick={handleImportFromCSV}>
+                    Import from CSV
                   </Button>
                   <Button type="button" variant="outline" onClick={handleExportToCSV}>
                     Export to CSV
